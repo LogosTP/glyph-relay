@@ -98,7 +98,8 @@ class Relay:
                  enroll_registry=None, session_rate=None, session_window=60.0,
                  authenticator=None, admin_secret=None, denylist=None, history=None,
                  target_allowlist=None, target_ports=None,
-                 max_ingest_events=500, max_ingest_bytes=262144):
+                 max_ingest_events=500, max_ingest_bytes=262144,
+                 ingest_rate=None, ingest_window=60.0):
         if manager is None:
             # Legacy single-session shim: build a one-entry manager from the
             # positional hub/submit/token arguments.  Import lazily to avoid a
@@ -136,6 +137,12 @@ class Relay:
         self.target_ports = target_ports
         self.max_ingest_events = max_ingest_events
         self.max_ingest_bytes = max_ingest_bytes
+        # Per-tenant ingest rate limit (Finding 1a). None = off (self-host / opt-out).
+        # One SlidingWindowRateLimiter per tenant, created lazily; checked AFTER auth so
+        # a foreign/rejected caller never spends the owner's budget.
+        self.ingest_rate = ingest_rate
+        self.ingest_window = ingest_window
+        self._ingest_limiters = {}
         self._server = None
 
     async def start(self):
@@ -493,6 +500,12 @@ class Relay:
             # Tenant mismatch: do not reveal existence beyond a flat 403.
             await self._respond(writer, 403, {"error": "forbidden"})
             return
+        # Per-tenant rate limit AFTER auth/ownership (so a foreign 403 caller never
+        # spends this tenant's budget) and BEFORE reading the body (a flood can't make
+        # us buffer large bodies). Bounds the durable-write rate.
+        if not self._ingest_allowed(tenant):
+            await self._respond(writer, 429, {"error": "rate_limited"})
+            return
         # Enforce the body-size cap up front (a too-long Content-Length reads as b"").
         try:
             length = int(headers.get("content-length", "0"))
@@ -515,7 +528,7 @@ class Relay:
         if len(events) > self.max_ingest_events:
             await self._respond(writer, 413, {"error": "too_large"})
             return
-        accepted = 0
+        rows = []
         for ev in events:
             if not isinstance(ev, dict):
                 await self._respond(writer, 400, {"error": "bad_request"})
@@ -528,12 +541,27 @@ class Relay:
                 await self._respond(writer, 400, {"error": "bad_kind"})
                 return
             # The relay is the ordering authority: publish() assigns the next monotonic
-            # id (> every existing id, hence > after) and write-throughs to history +
-            # live subscribers. The device's clientSeq is advisory and never used as id.
-            sess.hub.publish(kind, payload)
-            accepted += 1
+            # id (> every existing id, hence > after). The device's clientSeq is advisory
+            # and never used as the id. persist=False here -> RAM ring + live fan-out per
+            # event, but the durable rows go down in ONE append_many below (Finding 2),
+            # not a synchronous commit per event on the asyncio loop.
+            event_id = sess.hub.publish(kind, payload, persist=False)
+            rows.append((event_id, kind, payload))
+        if rows and sess.hub.sink is not None:
+            sess.hub.sink.append_many(sess.hub.tenant_id, sess.hub.session_key, rows)
         await self._respond(writer, 200,
-                            {"accepted": accepted, "lastEventId": sess.hub.last_event_id()})
+                            {"accepted": len(rows), "lastEventId": sess.hub.last_event_id()})
+
+    def _ingest_allowed(self, tenant):
+        """Per-tenant sliding-window ingest gate. True when no limit is configured
+        (self-host / opt-out) or the tenant is within budget."""
+        if self.ingest_rate is None:
+            return True
+        limiter = self._ingest_limiters.get(tenant)
+        if limiter is None:
+            limiter = SlidingWindowRateLimiter(self.ingest_rate, self.ingest_window)
+            self._ingest_limiters[tenant] = limiter
+        return limiter.allow(asyncio.get_running_loop().time())
 
     def _admin_ok(self, headers):
         """Constant-time X-Relay-Admin check. False when admin is disabled (self-host:

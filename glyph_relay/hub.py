@@ -40,7 +40,7 @@ class Hub:
             if highest is not None:
                 self._next_id = highest + 1
 
-    def publish(self, kind, data):
+    def publish(self, kind, data, persist=True):
         event = (self._next_id, kind, data)
         self._next_id += 1
         self._buf.append(event)
@@ -48,8 +48,10 @@ class Hub:
             self._buf = self._buf[-self.capacity:]
         # Write through to durable history BEFORE the RAM ring can trim this event.
         # The payload here is already post-_scrub (publish is only ever fed masked
-        # text), so no raw secret is persisted.
-        if self.sink is not None:
+        # text), so no raw secret is persisted. ``persist=False`` skips the per-event
+        # durable write so a batch path (ingest) can persist the whole window in ONE
+        # append_many instead of a synchronous commit per event.
+        if self.sink is not None and persist:
             self.sink.append(self.tenant_id, self.session_key, event[0], kind, data)
         for q in self._subs:
             if q.maxsize and q.full():

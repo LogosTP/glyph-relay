@@ -21,6 +21,8 @@ listing). All values are read by `config.build_relay("hosted", env)`.
 | `MAX_SESSIONS` / `MAX_PER_TENANT` | no | global / per-tenant session caps (default 200 / 5) |
 | `IDLE_TTL` | no | idle-session reap seconds (default 1800) |
 | `SESSION_RATE` / `SESSION_WINDOW` | no | POST /session rate limit |
+| `INGEST_RATE` / `INGEST_WINDOW` | no | per-tenant `/ingest` rate limit (default 60 reqs / 60 s; `0` disables) |
+| `HISTORY_MAX_ROWS_PER_SESSION` | no | durable-history ring bound per (tenant, session); default 20000 |
 
 Key rotation: to rotate `SHARED_HMAC_KEY`, the relay's `BrokerTokenAuth` accepts a
 **map** of `{kid: key}`. Add the new kid as current while keeping the previous so

@@ -43,7 +43,11 @@ def build_relay(mode, env):
         keys = {env["SHARED_HMAC_KID"]: env["SHARED_HMAC_KEY"].encode("utf-8")}
         denylist = set()
         from .history import HistoryStore
-        history = HistoryStore(env["HISTORY_DB"])
+        # Bound durable history per (tenant, session) so one session can't grow the
+        # shared SQLite file without limit (default ~20k events ≈ a long session).
+        history = HistoryStore(
+            env["HISTORY_DB"],
+            max_rows_per_session=_int(env, "HISTORY_MAX_ROWS_PER_SESSION", 20000))
         allowlist = None
         if env.get("RELAY_TARGET_ALLOWLIST"):
             from .targets import load_allowlist_file
@@ -63,7 +67,9 @@ def build_relay(mode, env):
             authenticator=BrokerTokenAuth(keys, denylist),
             admin_secret=env["RELAY_ADMIN_SECRET"], denylist=denylist, history=history,
             target_allowlist=allowlist, target_ports=target_ports,
-            session_rate=session_rate, session_window=session_window)
+            session_rate=session_rate, session_window=session_window,
+            ingest_rate=_int(env, "INGEST_RATE", 60) or None,
+            ingest_window=float(env.get("INGEST_WINDOW", "60")))
 
     if mode != "selfhost":
         raise ValueError("unknown relay mode: {0!r}".format(mode))

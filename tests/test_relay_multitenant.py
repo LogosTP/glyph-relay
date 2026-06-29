@@ -231,6 +231,22 @@ class MultiTenantRelayTest(unittest.IsolatedAsyncioTestCase):
             body={"events": [{"kind": "output", "data": {"text": "x"}}]})
         self.assertEqual(status, 403)
 
+    async def test_ingest_batch_is_monotonic_and_persisted(self):
+        # Finding 2: the whole batch persists durably with ids strictly monotonic.
+        _, a = await self._new_session("t-A")
+        key = a["token"]
+        batch = [{"kind": "output", "data": {"i": i}} for i in range(20)]
+        status, data = await _request(
+            self.port, "POST", "/sessions/{}/ingest".format(key),
+            headers={"Authorization": "Bearer " + key}, body={"events": batch})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["accepted"], 20)
+        rows = self.history.backlog("t-A", key)
+        ids = [r[0] for r in rows]
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(len(set(ids)), 20)                  # all distinct + persisted
+        self.assertEqual([r[2]["i"] for r in rows], list(range(20)))
+
     # --- admin (§3.5) ---
 
     async def test_admin_revoke_denylists_and_reaps(self):
@@ -269,6 +285,70 @@ class MultiTenantRelayTest(unittest.IsolatedAsyncioTestCase):
         status, _ = await _request(self.port, "POST", "/admin/revoke",
                                    body={"tenant_id": "t-A"})
         self.assertEqual(status, 401)
+
+
+class IngestRateLimitTest(unittest.IsolatedAsyncioTestCase):
+    """Finding 1a: /ingest is rate-limited per tenant (429 over budget), ordered
+    after auth (a rejected/foreign caller never consumes another tenant's budget)."""
+
+    async def asyncSetUp(self):
+        self._orig = sessions_mod.UserSession
+        sessions_mod.UserSession = _FakeUserSession
+        self.history = HistoryStore(":memory:")
+        self.mgr = SessionManager(host="default.mud", port=4000, use_tls=False,
+                                  history=self.history, max_sessions_per_tenant=5)
+        # Budget of 2 ingest requests per very-wide window so the 3rd is denied.
+        self.relay = Relay(manager=self.mgr, port=0,
+                           authenticator=BrokerTokenAuth({"v1": KEY}, set()),
+                           history=self.history, ingest_rate=2, ingest_window=1000.0)
+        await self.relay.start()
+        self.port = self.relay.port
+
+    async def asyncTearDown(self):
+        await self.relay.close()
+        await self.mgr.close_all()
+        self.history.close()
+        sessions_mod.UserSession = self._orig
+
+    async def _session(self, tid):
+        _, data = await _request(self.port, "POST", "/session",
+                                 headers={"X-Relay-Enroll": _token(tid)},
+                                 body={"email": "e@x.com", "password": "pw", "character": "C"})
+        return data["token"]
+
+    async def _ingest(self, key, tid):
+        return (await _request(
+            self.port, "POST", "/sessions/{}/ingest".format(key),
+            headers={"X-Relay-Enroll": _token(tid)},
+            body={"events": [{"kind": "output", "data": {"text": "x"}}]}))[0]
+
+    async def test_over_budget_is_429(self):
+        key = await self._session("t-A")
+        self.assertEqual(await self._ingest(key, "t-A"), 200)
+        self.assertEqual(await self._ingest(key, "t-A"), 200)
+        self.assertEqual(await self._ingest(key, "t-A"), 429)   # budget exhausted
+
+    async def test_budget_is_per_tenant(self):
+        ka = await self._session("t-A")
+        kb = await self._session("t-B")
+        # Drain A's budget; B is unaffected (noisy-neighbor isolation).
+        self.assertEqual(await self._ingest(ka, "t-A"), 200)
+        self.assertEqual(await self._ingest(ka, "t-A"), 200)
+        self.assertEqual(await self._ingest(ka, "t-A"), 429)
+        self.assertEqual(await self._ingest(kb, "t-B"), 200)
+        self.assertEqual(await self._ingest(kb, "t-B"), 200)
+
+    async def test_rate_after_auth_foreign_tenant_does_not_spend_budget(self):
+        # A foreign tenant's rejected (403) ingest must not consume the owner's budget.
+        ka = await self._session("t-A")
+        await self._session("t-B")
+        for _ in range(3):
+            # t-B targeting A's session -> 403, never reaches the limiter.
+            self.assertEqual(await self._ingest(ka, "t-B"), 403)
+        # A's full budget is intact.
+        self.assertEqual(await self._ingest(ka, "t-A"), 200)
+        self.assertEqual(await self._ingest(ka, "t-A"), 200)
+        self.assertEqual(await self._ingest(ka, "t-A"), 429)
 
 
 class SelfHostAdminDisabledTest(unittest.IsolatedAsyncioTestCase):
