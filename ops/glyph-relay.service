@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Elastic-2.0
+#
+# systemd unit TEMPLATE for glyph-relay in hosted mode. Install to
+# /etc/systemd/system/glyph-relay.service, drop the code at WorkingDirectory, place
+# secrets in the EnvironmentFile (root-owned 0600, NEVER in git), then:
+#   systemctl daemon-reload && systemctl enable --now glyph-relay
+#
+# The relay binds 127.0.0.1 ONLY; public reach comes from the cloudflared tunnel
+# (ops/cloudflared-relay.yml). /admin/* and the push-notify hop stay on loopback.
+
+[Unit]
+Description=Glyph relay (hosted mode)
+Documentation=https://github.com/LogosTP/glyph-relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Code checkout; read-only to the service under ProtectSystem=strict below.
+WorkingDirectory=/opt/glyph-relay
+# Secrets + tunables (see .env.example). Root-owned, mode 0600, never committed.
+EnvironmentFile=/etc/glyph-relay/relay.env
+# Bind loopback only; the tunnel terminates TLS and forwards here.
+ExecStart=/usr/bin/python3 -m glyph_relay --mode hosted --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=2
+
+# --- Identity ---------------------------------------------------------------
+# Ephemeral unprivileged user (no fixed UID, no shell, no home). Durable history
+# lives under StateDirectory -> /var/lib/glyph-relay; point HISTORY_DB there, e.g.
+#   HISTORY_DB=/var/lib/glyph-relay/history.db
+# (mount that path on an encrypted volume — see docs/privacy-hosted.md).
+# Swap to a fixed `glyph` system user (User=glyph / Group=glyph) if you prefer.
+DynamicUser=yes
+StateDirectory=glyph-relay
+StateDirectoryMode=0700
+
+# --- Hardening --------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# asyncio's selector loop uses socket.socketpair() (AF_UNIX) for its self-pipe, and
+# the relay talks TCP to the MUD over AF_INET/AF_INET6 — restrict to exactly those.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
