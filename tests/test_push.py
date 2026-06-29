@@ -8,10 +8,13 @@ shedding + exact payload fields via an injected dispatch; ``post_notify`` wire f
 against a local ``http.server`` AND its best-effort swallow of a dead-port error;
 ``Hub`` notifier threading (persist gate + error isolation); and ``SessionManager`` /
 ``UserSession`` / ``config`` threading of the notifier."""
+import asyncio
+import concurrent.futures
 import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest import mock
 
 import glyph_relay.hub as hub_mod
 import glyph_relay.sessions as sessions_mod
@@ -286,6 +289,73 @@ class UserSessionNotifierTests(unittest.TestCase):
     def test_real_user_session_default_hub_notifier_none(self):
         sess = UserSession("h", 23, "e@x.com", "pw", "Char", use_tls=False)
         self.assertIsNone(sess.hub.notifier)
+
+
+class PushNotifierForgetTests(unittest.TestCase):
+    def test_forget_drops_limiter_for_key(self):
+        n = PushNotifier("http://x/notify", "sek", dispatch=lambda p: None)
+        # A push-eligible event lazily creates the (tenant, session) limiter.
+        n("A", "sK", 1, "output", {"text": "hello"})
+        self.assertIn(("A", "sK"), n._limiters)
+        n.forget("A", "sK")
+        self.assertNotIn(("A", "sK"), n._limiters)
+
+    def test_forget_absent_key_is_noop(self):
+        n = PushNotifier("http://x/notify", "sek", dispatch=lambda p: None)
+        n.forget("nobody", "nothing")     # must not raise
+        self.assertEqual(n._limiters, {})
+
+
+class SessionManagerForgetTests(unittest.IsolatedAsyncioTestCase):
+    """unregister() must reclaim the torn-down session's push limiter so
+    PushNotifier._limiters can't grow for the daemon's lifetime."""
+
+    def setUp(self):
+        self._orig = sessions_mod.UserSession
+        sessions_mod.UserSession = _CapSession
+        _CapSession.last = None
+
+    def tearDown(self):
+        sessions_mod.UserSession = self._orig
+
+    async def test_unregister_forgets_session_limiter(self):
+        notifier = PushNotifier("http://x/notify", "sek", dispatch=lambda p: None)
+        mgr = SessionManager(host="h", port=1, push_notifier=notifier)
+        token = await mgr.create_user_session("e", "p", "c", tenant_id="A")
+        # Simulate a push-eligible event on this session: creates the ("A", token) limiter.
+        notifier("A", token, 1, "output", {"text": "hi"})
+        self.assertIn(("A", token), notifier._limiters)
+        await mgr.unregister(token)
+        self.assertNotIn(("A", token), notifier._limiters)
+
+    async def test_unregister_with_plain_callable_notifier_still_works(self):
+        # A plain callable notifier without forget() must not break teardown.
+        mgr = SessionManager(host="h", port=1, push_notifier=lambda *a: None)
+        token = await mgr.create_user_session("e", "p", "c", tenant_id="A")
+        self.assertTrue(await mgr.unregister(token))
+
+
+class PushNotifierExecutorTests(unittest.TestCase):
+    def test_has_own_bounded_executor(self):
+        n = PushNotifier("http://x", "s")
+        self.addCleanup(n.close)
+        self.assertIsInstance(n._executor, concurrent.futures.ThreadPoolExecutor)
+        self.assertLessEqual(n._executor._max_workers, 8)   # bounded, not unbounded
+
+
+class PushNotifierDispatchExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_dispatch_submits_to_own_executor_not_default(self):
+        n = PushNotifier("http://x", "s")
+        self.addCleanup(n.close)
+        loop = asyncio.get_running_loop()
+        # Patch the loop's run_in_executor so no real POST is offloaded; capture the
+        # executor argument and assert it is the notifier's OWN bounded pool (not None,
+        # which would be the relay's shared default pool used for DNS/SSRF resolution).
+        with mock.patch.object(loop, "run_in_executor") as m:
+            n._default_dispatch({"x": 1})
+        self.assertEqual(m.call_count, 1)
+        self.assertIs(m.call_args.args[0], n._executor)
+        self.assertIsNotNone(m.call_args.args[0])
 
 
 class ConfigPushTests(unittest.TestCase):

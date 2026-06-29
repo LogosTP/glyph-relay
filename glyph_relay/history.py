@@ -2,11 +2,12 @@
 """Durable per-tenant session history (SQLite) — spec §3.
 
 The ``Hub`` sinks every published event into this append-only store at
-``publish()`` time, AFTER id assignment and AFTER ``_scrub`` masking (the sink only
-ever sees ``********``-masked payloads — raw secrets are never persisted), so
-history survives the RAM ring trim and logout. Catch-up reads beyond the ~500-event
-RAM window come from here, and ``export``/``delete`` are tenant-scoped for
-admin-purge + GDPR-style erase.
+``publish()`` time, AFTER id assignment and AFTER ``_scrub`` masking. Masking happens
+upstream in sessions.py for EVERY kind — output and echo via ``scrub_secrets``,
+structured payloads via ``_scrub_structured`` — so the sink only ever sees
+``********``-masked payloads and raw secrets are never persisted. History survives the
+RAM ring trim and logout. Catch-up reads beyond the ~500-event RAM window come from
+here, and ``export``/``delete`` are tenant-scoped for admin-purge + GDPR-style erase.
 
 Encryption at rest is OPERATIONAL (disk/volume: FileVault/LUKS), keeping this module
 stdlib-only. Tenant isolation is enforced by always filtering on ``tenant_id``.

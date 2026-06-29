@@ -16,6 +16,7 @@ text are NEVER logged. Unset notify config ⇒ no ``PushNotifier`` is constructe
 self-host and hosted-without-push are byte-for-byte unchanged.
 """
 import asyncio
+import concurrent.futures
 import json
 import time
 import urllib.request
@@ -97,7 +98,16 @@ class PushNotifier:
         self._timeout = timeout
         self._dispatch = dispatch if dispatch is not None else self._default_dispatch
         # One SlidingWindowRateLimiter per (tenant_id, session_key), created lazily.
+        # Reclaimed by ``forget`` on session teardown so the map can't grow without
+        # bound across the daemon's lifetime.
         self._limiters = {}
+        # Own bounded executor for the notify POSTs (§4.2.1). Kept SEPARATE from the
+        # relay's default ThreadPoolExecutor so a slow/hung hosted sender can never queue
+        # behind — and thereby delay — new-session DNS/SSRF target resolution, which also
+        # offloads onto ``run_in_executor(None, ...)``. Lazy: no threads spawn until the
+        # first POST is dispatched, so constructing a notifier stays cheap.
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="glyph-notify")
 
     def __call__(self, tenant_id, session_key, event_id, kind, data):
         category, text = self._classify(kind, data)
@@ -112,6 +122,8 @@ class PushNotifier:
             if not limiter.allow(time.monotonic()):
                 # Shed under flood: highlight delivery is best-effort (spec §4.2.1).
                 return
+        # (the per-(tenant, session) limiter created above is reclaimed by ``forget``
+        # when the owning session is torn down — see SessionManager.unregister.)
         payload = {
             "tenant_id": tenant_id,
             "session_key": session_key,
@@ -123,13 +135,25 @@ class PushNotifier:
         }
         self._dispatch(payload)
 
+    def forget(self, tenant_id, session_key):
+        """Drop the rate-limiter bound to one (tenant, session) so ``_limiters`` is
+        reclaimed on session teardown instead of growing for the daemon's lifetime.
+        A no-op when the key is absent."""
+        self._limiters.pop((tenant_id, session_key), None)
+
     def _default_dispatch(self, payload):
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return  # no running loop (nothing to offload onto) — drop best-effort
+        # Offload onto our OWN bounded executor (NOT ``None`` = the loop's default pool),
+        # so a slow notify POST never queues ahead of new-session DNS/SSRF resolution.
         fut = loop.run_in_executor(
-            None, post_notify, self._url, self._secret, payload)
+            self._executor, post_notify, self._url, self._secret, payload)
         # Retrieve any executor exception so it is not reported as "never retrieved"
         # (post_notify itself already swallows, so this is belt-and-suspenders).
         fut.add_done_callback(lambda f: f.exception())
+
+    def close(self):
+        """Shut down the notify executor (no caller required — best-effort cleanup)."""
+        self._executor.shutdown(wait=False)

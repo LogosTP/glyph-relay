@@ -52,10 +52,12 @@ class Hub:
         if len(self._buf) > self.capacity:
             self._buf = self._buf[-self.capacity:]
         # Write through to durable history BEFORE the RAM ring can trim this event.
-        # The payload here is already post-_scrub (publish is only ever fed masked
-        # text), so no raw secret is persisted. ``persist=False`` skips the per-event
-        # durable write so a batch path (ingest) can persist the whole window in ONE
-        # append_many instead of a synchronous commit per event.
+        # Every payload here is already post-_scrub: sessions.py masks output, echo, AND
+        # structured upstream (via scrub_secrets / _scrub_structured) before calling
+        # publish, so no raw secret is ever persisted or fanned out for ANY kind.
+        # ``persist=False`` skips the per-event durable write so a batch path (ingest)
+        # can persist the whole window in ONE append_many instead of a synchronous
+        # commit per event.
         if self.sink is not None and persist:
             self.sink.append(self.tenant_id, self.session_key, event[0], kind, data)
         for q in self._subs:
