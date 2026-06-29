@@ -74,6 +74,10 @@ class Hub:
             return list(self._buf)
         return [e for e in self._buf if e[0] > since_id]
 
+    def last_event_id(self):
+        """Highest event id published so far (0 if none) — the session-list cursor."""
+        return self._next_id - 1
+
     def latest_status(self):
         """The most recent 'status' event still in the buffer, or None. The relay
         sends this to every newly-attached /events subscriber so it learns the

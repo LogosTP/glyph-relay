@@ -12,10 +12,6 @@ class BuildConfigTests(unittest.TestCase):
         self.assertIsInstance(r.authenticator, StaticEnrollAuth)
         self.assertIsNone(r.admin_secret)
         self.assertIsNone(r.history)
-        try:
-            self.addCleanup(lambda: None)
-        finally:
-            pass
 
     def test_selfhost_open_when_no_secret(self):
         r = build_relay("selfhost", {})
