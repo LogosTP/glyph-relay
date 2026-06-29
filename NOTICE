@@ -1,0 +1,20 @@
+Glyph Relay
+Copyright (c) 2026 the Glyph copyright holder. All rights reserved.
+
+This product is licensed under the Elastic License 2.0 (see LICENSE).
+
+TRADEMARK NOTICE
+----------------
+"Glyph" is a trademark of the copyright holder. The Elastic License 2.0 grants
+you rights to use, copy, modify, and redistribute this software, but it does NOT
+grant any right to use the "Glyph" name, logo, or other trademarks.
+
+If you distribute a modified version (a fork) of this software, you must RENAME
+it: remove the "Glyph" name and any Glyph branding from your distribution, and
+do not present your fork as being "Glyph" or as endorsed by or affiliated with
+the Glyph project. This keeps users from confusing an unofficial fork with the
+official Glyph relay.
+
+This applies in addition to the "Notices" section of the Elastic License 2.0,
+which prohibits altering, removing, or obscuring the licensor's licensing,
+copyright, or other notices.

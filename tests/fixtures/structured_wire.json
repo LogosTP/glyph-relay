@@ -1,0 +1,46 @@
+[
+  {
+    "type": "vitals",
+    "data": {
+      "gauges": {"hp": 100.0, "maxhp": 120.0, "mp": 30.0},
+      "fields": {"class": "mage"},
+      "name": "Aria",
+      "level": 42
+    }
+  },
+  {
+    "type": "room",
+    "data": {
+      "exits": {"n": "12346", "e": "12350"},
+      "id": "12345",
+      "name": "A dark cave",
+      "area": "Caverns"
+    }
+  },
+  {
+    "type": "commChannel",
+    "data": {
+      "channel": "gossip",
+      "text": "hi all",
+      "sender": "Bob"
+    }
+  },
+  {
+    "type": "raw",
+    "data": {
+      "package": "Foo.Bar",
+      "json": {"x": 1}
+    }
+  },
+  {
+    "type": "media",
+    "data": {
+      "kind": "music",
+      "file": "theme.mp3",
+      "url": "https://media.example.org/",
+      "volume": 60,
+      "loops": -1,
+      "type": "bg"
+    }
+  }
+]
