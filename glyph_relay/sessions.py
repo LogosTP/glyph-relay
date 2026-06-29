@@ -25,8 +25,9 @@ class UserSession:
     """One product user's RAM-only MUD session, driven solely by the relay."""
 
     def __init__(self, host, port, email, password, character, *,
-                 use_tls=True, ca_file=None, backlog=500,
-                 term_width=120, term_height=40, reconnect=True):
+                 use_tls=True, ca_file=None, ca_data=None, backlog=500,
+                 term_width=120, term_height=40, reconnect=True,
+                 connect_host=None, history=None, tenant_id=None, session_key=None):
         self.host = host
         self.port = port
         self.email = email
@@ -34,10 +35,19 @@ class UserSession:
         self.character = character
         self.use_tls = use_tls
         self.ca_file = ca_file
+        self.ca_data = ca_data
+        # §2.2 DNS-rebind defense: when set, the socket connects to this pinned IP
+        # while TLS SNI/cert verification still uses the original ``host``.
+        self.connect_host = connect_host
         self.term_width = term_width
         self.term_height = term_height
         self.reconnect = reconnect
-        self.hub = Hub(backlog)
+        # Per-tenant tag (§2.3) + durable history sink (§3). Self-host leaves both at
+        # their defaults: tenant_id=None, history=None -> a RAM-only Hub, unchanged.
+        self.tenant_id = tenant_id
+        self.session_key = session_key
+        self.created_at = None        # wall-clock epoch, set by the manager at mint
+        self.hub = Hub(backlog, sink=history, tenant_id=tenant_id, session_key=session_key)
         self._steps = default_login_steps(email, password, character)
         self._secrets = {s.value for s in self._steps if s.secret and s.value}
         self._login = LoginFlow(self._steps)
@@ -93,7 +103,8 @@ class UserSession:
         loop = asyncio.get_running_loop()
         while True:
             conn = Connection(self.host, self.port, self.use_tls, False,
-                              negotiator=self._build_negotiator(), cafile=self.ca_file)
+                              negotiator=self._build_negotiator(), cafile=self.ca_file,
+                              cadata=self.ca_data, connect_host=self.connect_host)
             self._conn = conn
             connected_at = None
             try:
@@ -165,16 +176,22 @@ class SessionHandle:
 
 class SessionManager:
     def __init__(self, *, host, port, use_tls=True, ca_file=None, max_user_sessions=20,
-                 idle_ttl=None, enroll_registry=None):
+                 idle_ttl=None, enroll_registry=None, max_sessions_per_tenant=None,
+                 history=None):
         self.host = host
         self.port = port
         self.use_tls = use_tls
         self.ca_file = ca_file
         self.max_user_sessions = max_user_sessions
+        # Per-tenant cap (§2.3 noisy-neighbor): None = no per-tenant limit (self-host,
+        # where the global cap is the only bound). Enforced alongside the global cap.
+        self.max_sessions_per_tenant = max_sessions_per_tenant
         self.idle_ttl = idle_ttl          # seconds; None = idle reaper disabled
         # Enrollment registry (#140): None = no per-user revocation. When set, the
         # reaper tears down sessions whose minting enrollment id has been revoked/expired.
         self.enroll_registry = enroll_registry
+        # Durable per-tenant history sink (§3). None = RAM-only Hubs (self-host).
+        self.history = history
         self._bootstrap_token = None
         self._handles = {}            # token -> SessionHandle
         self._sessions = {}           # token -> UserSession (user sessions only)
@@ -195,8 +212,55 @@ class SessionManager:
                 return handle
         return None
 
-    def count_user_sessions(self):
-        return len(self._sessions)
+    def count_user_sessions(self, tenant_id=None):
+        """Live user-session count: global (``tenant_id=None``) or for one tenant."""
+        if tenant_id is None:
+            return len(self._sessions)
+        return sum(1 for s in self._sessions.values()
+                   if getattr(s, "tenant_id", None) == tenant_id)
+
+    def tenant_for_token(self, token):
+        """The owning tenant id for a bearer token, or ``None`` if it owns no live
+        user session. Constant-time per entry (mirrors ``resolve``)."""
+        if not isinstance(token, str):
+            return None
+        cand = token.encode("utf-8")
+        for tok, sess in self._sessions.items():
+            if hmac.compare_digest(cand, tok.encode("utf-8")):
+                return getattr(sess, "tenant_id", None)
+        return None
+
+    def list_tenant_sessions(self, tenant_id):
+        """The caller's own live sessions (§2.4) — tenant-scoped, never global, never
+        the password. ``sessionKey`` is the bearer token; ``lastEventId`` is the Hub
+        cursor for #141's re-attach."""
+        out = []
+        for token, sess in self._sessions.items():
+            if getattr(sess, "tenant_id", None) != tenant_id:
+                continue
+            row = {
+                "host": sess.host,
+                "port": sess.port,
+                "tls": bool(sess.use_tls),
+                "email": sess.email,
+                "sessionKey": token,
+                "createdAt": sess.created_at,
+                "lastEventId": sess.hub.last_event_id(),
+            }
+            if sess.character is not None:
+                row["character"] = sess.character
+            out.append(row)
+        return out
+
+    def session_for_token(self, token):
+        """The live ``UserSession`` a bearer token owns, or ``None`` (constant-time)."""
+        if not isinstance(token, str):
+            return None
+        cand = token.encode("utf-8")
+        for tok, sess in self._sessions.items():
+            if hmac.compare_digest(cand, tok.encode("utf-8")):
+                return sess
+        return None
 
     async def reap_idle(self, now):
         """Close and unregister user sessions that have been idle longer than
@@ -245,15 +309,38 @@ class SessionManager:
                 # cancel still propagates and ends the loop here.
                 pass
 
-    async def create_user_session(self, email, password, character, enrollment_id=None):
+    async def create_user_session(self, email, password, character, *,
+                                  tenant_id=None, target=None, connect_host=None,
+                                  enrollment_id=None, now=None):
+        """Mint a per-user session. ``email``/``password``/``character`` stay the
+        first three positional args (self-host call sites unchanged). ``target`` is an
+        optional ``{host, port, tls, ca?}`` per-server override (§2.1); ``connect_host``
+        is the SSRF-pinned IP (§2.2); ``tenant_id`` tags the session for isolation +
+        per-tenant quota; ``enrollment_id`` binds it for the #140 revocation reaper."""
+        # Global cap then per-tenant cap, both BEFORE minting (§2.3).
         if self.count_user_sessions() >= self.max_user_sessions:
             raise SessionLimitError()
+        if (self.max_sessions_per_tenant is not None and tenant_id is not None
+                and self.count_user_sessions(tenant_id) >= self.max_sessions_per_tenant):
+            raise SessionLimitError()
+        host = self.host
+        port = self.port
+        use_tls = self.use_tls
+        ca_data = None
+        if target is not None:
+            host = target["host"]
+            port = int(target["port"])
+            use_tls = bool(target["tls"])
+            ca_data = target.get("ca")
         # sess.start() schedules via create_task and never suspends, so nothing
         # can interleave between the cap-check above and the register below — no TOCTOU.
         token = _secrets_mod.token_urlsafe(32)
-        sess = UserSession(host=self.host, port=self.port, email=email,
+        sess = UserSession(host=host, port=port, email=email,
                            password=password, character=character,
-                           use_tls=self.use_tls, ca_file=self.ca_file)
+                           use_tls=use_tls, ca_file=self.ca_file, ca_data=ca_data,
+                           connect_host=connect_host, history=self.history,
+                           tenant_id=tenant_id, session_key=token)
+        sess.created_at = now if now is not None else time.time()
         await sess.start()
         self._sessions[token] = sess
         self._handles[token] = SessionHandle(sess.hub, sess.submit,
@@ -263,6 +350,15 @@ class SessionManager:
         if enrollment_id is not None:
             self._enrollments[token] = enrollment_id
         return token
+
+    async def reap_tenant(self, tenant_id):
+        """Close + unregister every live session owned by ``tenant_id`` (admin revoke,
+        §3.5). Returns the number reaped. Bootstrap is exempt (never in ``_sessions``)."""
+        victims = [tok for tok, s in self._sessions.items()
+                   if getattr(s, "tenant_id", None) == tenant_id]
+        for tok in victims:
+            await self.unregister(tok)
+        return len(victims)
 
     async def unregister(self, token):
         handle = self._handles.get(token)

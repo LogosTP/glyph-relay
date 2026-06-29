@@ -60,7 +60,8 @@ def _bearer(headers):
 
 _REASONS = {200: "OK", 202: "Accepted", 400: "Bad Request",
             401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
-            409: "Conflict", 429: "Too Many Requests", 503: "Service Unavailable"}
+            409: "Conflict", 413: "Payload Too Large", 429: "Too Many Requests",
+            503: "Service Unavailable"}
 
 
 class SlidingWindowRateLimiter:
@@ -88,9 +89,16 @@ class SlidingWindowRateLimiter:
 
 
 class Relay:
+    # Ingest (§3.2): the closed kind-allowlist for device-supplied history. Never
+    # 'status'/'structured' — a device cannot spoof authoritative live state.
+    INGEST_KINDS = ("output", "echo")
+
     def __init__(self, hub=None, submit=None, token=None, manager=None,
                  host="127.0.0.1", port=8765, keepalive=15.0, read_timeout=30.0,
-                 enroll_registry=None, session_rate=None, session_window=60.0):
+                 enroll_registry=None, session_rate=None, session_window=60.0,
+                 authenticator=None, admin_secret=None, denylist=None, history=None,
+                 target_allowlist=None, target_ports=None,
+                 max_ingest_events=500, max_ingest_bytes=262144):
         if manager is None:
             # Legacy single-session shim: build a one-entry manager from the
             # positional hub/submit/token arguments.  Import lazily to avoid a
@@ -115,6 +123,19 @@ class Relay:
         self.enroll_registry = enroll_registry
         self.session_limiter = (SlidingWindowRateLimiter(session_rate, session_window)
                                 if session_rate else None)
+        # Multi-tenant additions (hosted mode; all None/off in self-host):
+        #   - authenticator: an auth.Authenticator that maps a request to a tenant id.
+        #     When set it takes precedence over enroll_registry (broker-token / static).
+        #   - admin_secret/denylist/history: the X-Relay-Admin revoke/purge surface.
+        #   - target_allowlist/target_ports: SSRF policy for the per-server target.
+        self.authenticator = authenticator
+        self.admin_secret = admin_secret
+        self.denylist = denylist
+        self.history = history
+        self.target_allowlist = target_allowlist
+        self.target_ports = target_ports
+        self.max_ingest_events = max_ingest_events
+        self.max_ingest_bytes = max_ingest_bytes
         self._server = None
 
     async def start(self):
@@ -148,6 +169,21 @@ class Relay:
             return
         if method == "POST" and route == "/session":
             await self._serve_create_session(reader, writer, headers)
+            return
+
+        # Admin routes (X-Relay-Admin secret; disabled in self-host where it is None).
+        if method == "POST" and route in ("/admin/revoke", "/admin/purge"):
+            await self._serve_admin(reader, writer, headers, route)
+            return
+
+        # Tenant-scoped routes: authed by bearer OR enrollment/broker for the tenant.
+        if method == "GET" and route == "/sessions":
+            await self._serve_list_sessions(writer, headers)
+            return
+        if (method == "POST" and route.startswith("/sessions/")
+                and route.endswith("/ingest")):
+            session_key = route[len("/sessions/"):-len("/ingest")]
+            await self._serve_ingest(reader, writer, headers, session_key)
             return
 
         # All remaining routes require a valid bearer token.
@@ -202,19 +238,52 @@ class Relay:
         return await loop.run_in_executor(
             None, self.enroll_registry.verify, ident, secret, time.time())
 
-    async def _serve_create_session(self, reader, writer, headers):
-        """Handle POST /session — open route, never log body or minted token."""
+    async def _read_body(self, reader, headers):
+        """Read the request body (bounded by Content-Length + read_timeout). Returns
+        the raw bytes, or b"" on a missing/negative/oversized/short read."""
         try:
             length = int(headers.get("content-length", "0"))
         except ValueError:
             length = 0
-        body = b""
-        if length > 0:
-            try:
-                body = await asyncio.wait_for(
-                    reader.readexactly(length), self.read_timeout)
-            except (asyncio.IncompleteReadError, OSError, asyncio.TimeoutError):
-                body = b""
+        if length <= 0 or length > self.max_ingest_bytes:
+            # A negative/absent length yields no body; an over-cap length is refused
+            # here so an oversized ingest never buffers into memory.
+            return b""
+        try:
+            return await asyncio.wait_for(reader.readexactly(length), self.read_timeout)
+        except (asyncio.IncompleteReadError, OSError, asyncio.TimeoutError):
+            return b""
+
+    @staticmethod
+    def _parse_target(data):
+        """Validate an optional ``target`` from a /session body.
+
+        Returns ``(target_or_None, ok)``: ``ok`` is False only when ``target`` is
+        present but malformed (missing/typed-wrong host/port/tls) -> the caller 400s."""
+        target = data.get("target")
+        if target is None:
+            return None, True
+        try:
+            host = target["host"]
+            port = target["port"]
+            tls = target["tls"]
+        except (KeyError, TypeError):
+            return None, False
+        if not (isinstance(host, str) and host and isinstance(port, int)
+                and not isinstance(port, bool) and isinstance(tls, bool)):
+            return None, False
+        out = {"host": host, "port": port, "tls": tls}
+        ca = target.get("ca")
+        if ca is not None:
+            if not isinstance(ca, str):
+                return None, False
+            out["ca"] = ca
+        return out, True
+
+    async def _serve_create_session(self, reader, writer, headers):
+        """Handle POST /session — never log body or minted token. Ordering per spec
+        §2.1: body-400 -> auth-403 -> forbidden_target-403 -> rate-429 -> cap-503."""
+        body = await self._read_body(reader, headers)
         try:
             data = json.loads(body.decode("utf-8")) if body else {}
             if not isinstance(data, dict):
@@ -228,21 +297,36 @@ class Relay:
         except (ValueError, KeyError, TypeError, UnicodeDecodeError):
             await self._respond(writer, 400, {"error": "bad_request"})
             return
-        # Enrollment gate (#140), checked AFTER the body is fully read so a rejected
-        # credential returns a clean 403 instead of RST-ing the connection with an
-        # undrained body over the tunnel (which the app would see as a network error,
-        # not .forbidden). Still before the rate limit, so unauthorized callers never
-        # consume the create budget. enrollment_id binds the session to its credential
-        # so the reaper can tear it down on revocation; None when the endpoint is open.
-        enrollment_id = None
-        if self.enroll_registry is not None:
-            enrollment_id = await self._enroll_verify(headers)
-            if enrollment_id is None:
-                await self._respond(writer, 403, {"error": "forbidden"})
+        # Target SHAPE validation is part of the body-400 phase (no I/O yet).
+        target, ok = self._parse_target(data)
+        if not ok:
+            await self._respond(writer, 400, {"error": "bad_request"})
+            return
+        # Auth gate, checked AFTER the body is fully read so a rejected credential
+        # returns a clean 403 instead of RST-ing an undrained body over the tunnel.
+        # Still before the rate limit, so unauthorized callers never consume budget.
+        # tenant_id tags the session for isolation/quota; enrollment_id binds it to a
+        # #140 credential for the revocation reaper (self-host only).
+        tenant_id, enrollment_id, authed = await self._authenticate_create(headers)
+        if not authed:
+            await self._respond(writer, 403, {"error": "forbidden"})
+            return
+        # Per-server target SSRF guard (§2.2): resolve ONCE, pin the IP, connect to it.
+        # Runs only for authenticated callers (no unauthenticated SSRF probing).
+        connect_host = None
+        if target is not None:
+            from .targets import is_allowed_target
+            loop = asyncio.get_running_loop()
+            pinned = await loop.run_in_executor(
+                None, lambda: is_allowed_target(
+                    target["host"], target["port"],
+                    allowlist=self.target_allowlist, ports=self.target_ports))
+            if pinned is None:
+                await self._respond(writer, 403, {"error": "forbidden_target"})
                 return
-        # Rate-limit session creation: after the body validates (a 400 must not cost
-        # budget) and before we open a MUD socket. Counts attempts, so a flood is
-        # bounded even below the concurrent-session cap.
+            connect_host = pinned
+        # Rate-limit after validation+auth (a 400/403 must not cost budget) and before
+        # opening a MUD socket. Counts attempts, so a flood is bounded below the cap.
         if self.session_limiter is not None and \
                 not self.session_limiter.allow(asyncio.get_running_loop().time()):
             await self._respond(writer, 429, {"error": "rate_limited"})
@@ -251,12 +335,28 @@ class Relay:
         from .sessions import SessionLimitError
         try:
             token = await self.manager.create_user_session(
-                email, password, character, enrollment_id=enrollment_id)
+                email, password, character, tenant_id=tenant_id, target=target,
+                connect_host=connect_host, enrollment_id=enrollment_id)
         except SessionLimitError:
             await self._respond(writer, 503, {"error": "session_limit"})
             return
         # Respond with the token only — never echo back the credentials.
         await self._respond(writer, 200, {"token": token})
+
+    async def _authenticate_create(self, headers):
+        """Resolve a POST /session caller to ``(tenant_id, enrollment_id, authed)``.
+
+        Precedence: an injected ``authenticator`` (hosted broker / static) wins; else
+        the #140 ``enroll_registry`` (tenant == enrollment id); else the endpoint is
+        open (tenant ``"self"``, unbound). ``authed`` is False only on a present-but-
+        rejected credential."""
+        if self.authenticator is not None:
+            tenant_id = self.authenticator.authenticate(headers)
+            return tenant_id, None, tenant_id is not None
+        if self.enroll_registry is not None:
+            enrollment_id = await self._enroll_verify(headers)
+            return enrollment_id, enrollment_id, enrollment_id is not None
+        return "self", None, True
 
     async def _serve_command(self, reader, writer, headers, submit):
         try:
@@ -322,7 +422,10 @@ class Relay:
             writer.write(format_sse_event(sid, skind, sdata).encode("utf-8"))
             emitted_status_id = sid
         try:
-            for event_id, kind, data in hub.backlog(since_id):
+            # durable_backlog reads the full SQLite history when a sink is wired
+            # (hosted: catch-up can exceed the ~500-event RAM ring), else the RAM ring
+            # (self-host, unchanged).
+            for event_id, kind, data in hub.durable_backlog(since_id):
                 if event_id == emitted_status_id:
                     continue  # already sent as the leading status snapshot
                 writer.write(format_sse_event(event_id, kind, data).encode("utf-8"))
@@ -346,3 +449,120 @@ class Relay:
         finally:
             hub.unsubscribe(q)
             writer.close()
+
+    # --- multi-tenant routes (§2.4 / §3.2 / §3.5) ------------------------------
+
+    async def _resolve_tenant(self, headers):
+        """The caller's tenant id for a tenant-scoped route, or ``None``.
+
+        Accepts a bearer token of one of the caller's own sessions, OR an
+        enrollment/broker credential in ``X-Relay-Enroll`` (§2.4). Never global."""
+        token = _bearer(headers)
+        tenant = self.manager.tenant_for_token(token)
+        if tenant is not None:
+            return tenant
+        if self.authenticator is not None:
+            return self.authenticator.authenticate(headers)
+        if self.enroll_registry is not None:
+            return await self._enroll_verify(headers)
+        return None
+
+    async def _serve_list_sessions(self, writer, headers):
+        """GET /sessions — the caller's OWN live sessions only (§2.4), never the
+        password, never another tenant's rows."""
+        tenant = await self._resolve_tenant(headers)
+        if tenant is None:
+            await self._respond(writer, 401, {"error": "unauthorized"})
+            return
+        await self._respond(writer, 200,
+                            {"sessions": self.manager.list_tenant_sessions(tenant)})
+
+    async def _serve_ingest(self, reader, writer, headers, session_key):
+        """POST /sessions/{sessionKey}/ingest — slot a device-supplied history window
+        into the monotonic stream (§3.2). Tenant-authed + owned-session-only. The relay
+        assigns its OWN ids (> after); clientSeq is advisory; kind is allowlisted."""
+        tenant = await self._resolve_tenant(headers)
+        if tenant is None:
+            await self._respond(writer, 401, {"error": "unauthorized"})
+            return
+        sess = self.manager.session_for_token(session_key)
+        if sess is None:
+            await self._respond(writer, 404, {"error": "not_found"})
+            return
+        if getattr(sess, "tenant_id", None) != tenant:
+            # Tenant mismatch: do not reveal existence beyond a flat 403.
+            await self._respond(writer, 403, {"error": "forbidden"})
+            return
+        # Enforce the body-size cap up front (a too-long Content-Length reads as b"").
+        try:
+            length = int(headers.get("content-length", "0"))
+        except ValueError:
+            length = 0
+        if length > self.max_ingest_bytes:
+            await self._respond(writer, 413, {"error": "too_large"})
+            return
+        body = await self._read_body(reader, headers)
+        try:
+            data = json.loads(body.decode("utf-8")) if body else {}
+            if not isinstance(data, dict):
+                raise ValueError
+            events = data["events"]
+            if not isinstance(events, list):
+                raise ValueError
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+            await self._respond(writer, 400, {"error": "bad_request"})
+            return
+        if len(events) > self.max_ingest_events:
+            await self._respond(writer, 413, {"error": "too_large"})
+            return
+        accepted = 0
+        for ev in events:
+            if not isinstance(ev, dict):
+                await self._respond(writer, 400, {"error": "bad_request"})
+                return
+            kind = ev.get("kind")
+            payload = ev.get("data")
+            # Closed kind-allowlist: a device cannot inject 'status'/'structured' and
+            # spoof authoritative live state.
+            if kind not in self.INGEST_KINDS:
+                await self._respond(writer, 400, {"error": "bad_kind"})
+                return
+            # The relay is the ordering authority: publish() assigns the next monotonic
+            # id (> every existing id, hence > after) and write-throughs to history +
+            # live subscribers. The device's clientSeq is advisory and never used as id.
+            sess.hub.publish(kind, payload)
+            accepted += 1
+        await self._respond(writer, 200,
+                            {"accepted": accepted, "lastEventId": sess.hub.last_event_id()})
+
+    def _admin_ok(self, headers):
+        """Constant-time X-Relay-Admin check. False when admin is disabled (self-host:
+        ``admin_secret`` is None) so the admin surface is simply absent there."""
+        if self.admin_secret is None:
+            return False
+        provided = headers.get("x-relay-admin", "").encode("latin-1")
+        return hmac.compare_digest(provided, self.admin_secret.encode("utf-8"))
+
+    async def _serve_admin(self, reader, writer, headers, route):
+        """POST /admin/revoke|purge — X-Relay-Admin-gated (§3.5). revoke denylists the
+        tenant + reaps its live sessions; purge deletes its durable history."""
+        if not self._admin_ok(headers):
+            await self._respond(writer, 401, {"error": "unauthorized"})
+            return
+        body = await self._read_body(reader, headers)
+        try:
+            data = json.loads(body.decode("utf-8")) if body else {}
+            tid = data.get("tenant_id") if isinstance(data, dict) else None
+        except (ValueError, UnicodeDecodeError):
+            tid = None
+        if not isinstance(tid, str) or not tid:
+            await self._respond(writer, 400, {"error": "bad_request"})
+            return
+        if route == "/admin/revoke":
+            if self.denylist is not None:
+                self.denylist.add(tid)        # future broker tokens for tid are rejected
+            reaped = await self.manager.reap_tenant(tid)   # tear down live sessions now
+            await self._respond(writer, 200, {"status": "ok", "reaped": reaped})
+        else:  # /admin/purge
+            deleted = self.history.delete(tid) if self.history is not None else 0
+            await self._respond(writer, 200, {"status": "ok", "deleted": deleted})

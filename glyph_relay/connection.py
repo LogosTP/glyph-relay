@@ -8,11 +8,11 @@ from .telnet import TelnetCodec
 from .negotiator import Negotiator, NAWS
 
 
-def make_ssl_context(verify, cafile=None):
-    # Passing cafile pins trust to exactly that CA (system roots are NOT
+def make_ssl_context(verify, cafile=None, cadata=None):
+    # Passing cafile/cadata pins trust to exactly that CA (system roots are NOT
     # loaded), which is what we want for a MUD's private root CA. With verify
     # on, the chain and hostname are both checked.
-    ctx = ssl.create_default_context(cafile=cafile)
+    ctx = ssl.create_default_context(cafile=cafile, cadata=cadata)
     if not verify:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -21,12 +21,17 @@ def make_ssl_context(verify, cafile=None):
 
 class Connection:
     def __init__(self, host, port, use_tls=True, verify=False, raw_logger=None,
-                 negotiator=None, cafile=None):
+                 negotiator=None, cafile=None, cadata=None, connect_host=None):
         self.host = host
         self.port = port
         self.use_tls = use_tls
         self.verify = verify
         self.cafile = cafile
+        self.cadata = cadata
+        # §2.2: the address actually dialed. When None, dial ``host`` (self-host,
+        # unchanged). When set (the relay's pinned IP), dial THAT while TLS SNI/cert
+        # verification still uses ``host`` -- so a DNS rebind cannot redirect us.
+        self.connect_host = connect_host
         self.raw_logger = raw_logger
         self._reader = None
         self._writer = None
@@ -35,9 +40,15 @@ class Connection:
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     async def connect(self):
-        ssl_ctx = make_ssl_context(self.verify, self.cafile) if self.use_tls else None
+        ssl_ctx = (make_ssl_context(self.verify, self.cafile, self.cadata)
+                   if self.use_tls else None)
+        dial = self.connect_host or self.host
+        kwargs = {}
+        if ssl_ctx is not None and dial != self.host:
+            # Dialing the pinned IP: keep SNI + cert hostname = the original host.
+            kwargs["server_hostname"] = self.host
         self._reader, self._writer = await asyncio.open_connection(
-            self.host, self.port, ssl=ssl_ctx
+            dial, self.port, ssl=ssl_ctx, **kwargs
         )
 
     async def receive(self):
