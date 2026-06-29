@@ -20,6 +20,41 @@ import json
 
 # Telnet option for the Generic MUD Communication Protocol (out-of-band JSON).
 GMCP = 201
+# MSSP (MUD Server Status Protocol, opt 70) and MSDP (MUD Server Data Protocol,
+# opt 69). The relay forwards these as structured events too (#146) so a relay-mode
+# client can resolve ServerFeaturePolicy exactly like direct mode.
+MSSP = 70
+MSDP = 69
+
+# MSSP framing bytes inside the subneg body (de-facto protocol; mudhalla.net).
+_MSSP_VAR = 1
+_MSSP_VAL = 2
+
+# MSDP framing bytes (tintin.mudhalla.net/protocols/msdp).
+_MSDP_VAR = 1
+_MSDP_VAL = 2
+_MSDP_TABLE_OPEN = 3
+_MSDP_TABLE_CLOSE = 4
+_MSDP_ARRAY_OPEN = 5
+_MSDP_ARRAY_CLOSE = 6
+
+# Defensive caps mirroring the iOS MSSP/MSDP codecs: bound a hostile/runaway subneg
+# so the relay isn't a soft target. 256 KiB body comfortably exceeds any real frame;
+# MSDP depth 32 bounds native recursion against a depth-bomb that fits under the size cap.
+_MAX_SUBNEG_BODY = 256 * 1024
+_MSDP_MAX_DEPTH = 32
+
+# MSDP standard reportable variables that drive the vitals HUD (mirrors MSDP.swift's
+# vitalsVariables); anything else MSDP carries reaches the inspector as ``raw``.
+_MSDP_VITALS = frozenset({
+    "HEALTH", "HEALTH_MAX", "MAXHEALTH",
+    "MANA", "MANA_MAX", "MAXMANA",
+    "MOVEMENT", "MOVEMENT_MAX", "MAXMOVEMENT",
+    "EXPERIENCE", "EXPERIENCE_MAX", "EXPERIENCE_TNL",
+    "MONEY", "ALIGNMENT", "WIMPY",
+    "OPPONENT_HEALTH", "OPPONENT_HEALTH_MAX", "OPPONENT_LEVEL", "OPPONENT_NAME",
+    "CHARACTER_NAME", "LEVEL",
+})
 
 # GMCP packages whose JSON we map onto a typed StructuredEvent. Lower-cased for a
 # case-insensitive match; anything not listed is preserved verbatim as ``raw``.
@@ -70,26 +105,262 @@ def gmcp_to_structured(package, data):
 
 
 def structured_from_subneg(payload):
-    """Map one Telnet subneg ``payload`` to a StructuredEvent wire dict, or ``None``
-    if it is not a GMCP package this build forwards. Pure; the caller publishes the
-    dict to the hub under the ``"structured"`` SSE event name."""
+    """Map one Telnet subneg ``payload`` to a single StructuredEvent wire dict, or
+    ``None`` when it is not a GMCP/MSSP frame this build forwards. (MSDP can yield
+    SEVERAL events from one frame — use ``structured_events_from_subneg`` for the full
+    list.) Pure; the caller publishes the dict under the ``"structured"`` SSE name."""
     parsed = parse_gmcp(payload)
-    if parsed is None:
-        return None
-    package, data = parsed
-    return gmcp_to_structured(package, data)
+    if parsed is not None:
+        package, data = parsed
+        return gmcp_to_structured(package, data)
+    if payload and payload[0] == MSSP:
+        status = parse_mssp(payload)
+        if status is not None:
+            return mssp_to_structured(status)
+    return None
+
+
+def structured_events_from_subneg(payload):
+    """Zero or more StructuredEvent wire dicts for one subneg: GMCP/MSSP yield at most
+    one; MSDP may batch several variables (vitals + room + raws) into one frame (#146)."""
+    if not payload:
+        return []
+    option = payload[0]
+    if option == GMCP:
+        ev = structured_from_subneg(payload)
+        return [ev] if ev is not None else []
+    if option == MSSP:
+        status = parse_mssp(payload)
+        return [mssp_to_structured(status)] if status is not None else []
+    if option == MSDP:
+        variables = parse_msdp(payload)
+        if variables is None:
+            return []
+        return msdp_to_structured_events(variables)
+    return []
 
 
 def structured_events(events):
-    """Yield StructuredEvent wire dicts for the GMCP subnegotiations in a codec
-    event list, skipping prompts and non-GMCP subnegs. The relay readers publish
-    each yielded dict to the hub as a ``"structured"`` SSE event."""
+    """Yield StructuredEvent wire dicts for the GMCP/MSSP/MSDP subnegotiations in a
+    codec event list, skipping prompts and unforwarded subnegs. The relay readers
+    publish each yielded dict to the hub as a ``"structured"`` SSE event (#59/#146)."""
     for kind, payload in events:
         if kind != "subneg":
             continue
-        structured = structured_from_subneg(payload)
-        if structured is not None:
+        for structured in structured_events_from_subneg(payload):
             yield structured
+
+
+# --- MSSP (opt 70) -> serverStatus ------------------------------------------
+
+def parse_mssp(payload):
+    """Parse an MSSP subneg ``payload`` (starting with option byte 70) into
+    ``{name: [values]}``. Both multi-value forms (several MSSP_VAL under one
+    MSSP_VAR, or a repeated MSSP_VAR) accumulate. Empty names are skipped. Returns
+    ``None`` when ``payload`` is not MSSP or its body exceeds the size cap."""
+    if not payload or payload[0] != MSSP:
+        return None
+    body = payload[1:]
+    if len(body) > _MAX_SUBNEG_BODY:
+        return None
+    # Tokenize into (field, bytes); field is "name" (after VAR) or "value" (after VAL).
+    tokens = []
+    field = None
+    buf = bytearray()
+    for b in body:
+        if b == _MSSP_VAR or b == _MSSP_VAL:
+            if field is not None:
+                tokens.append((field, bytes(buf)))
+            field = "name" if b == _MSSP_VAR else "value"
+            buf = bytearray()
+        else:
+            buf.append(b)
+    if field is not None:
+        tokens.append((field, bytes(buf)))
+    values = {}
+    current_key = None
+    for ftype, raw in tokens:
+        text = raw.decode("utf-8", "replace")
+        if ftype == "name":
+            if not text:
+                current_key = None
+                continue
+            current_key = text
+            values.setdefault(text, [])
+        elif current_key is not None:
+            values.setdefault(current_key, []).append(text)
+    return values
+
+
+def mssp_to_structured(values):
+    """An MSSP ``{name: [values]}`` map -> the ``serverStatus`` wire shape. Matches the
+    Swift ``ServerStatus`` Codable (single ``values`` field) so direct + relay agree."""
+    return {"type": "serverStatus", "data": {"values": values}}
+
+
+# --- MSDP (opt 69) -> vitals / room / raw -----------------------------------
+
+class _MsdpParser:
+    """Recursive-descent parser over an MSDP body (mirrors MSDP.swift). Scalars become
+    ``str``, tables become ``dict``, arrays become ``list``; descent is bounded at
+    ``_MSDP_MAX_DEPTH`` (a depth-bomb sets ``overflowed`` and the frame is dropped)."""
+
+    def __init__(self, body):
+        self.b = body
+        self.i = 0
+        self.depth = 0
+        self.overflowed = False
+
+    def parse_pairs(self, terminator):
+        obj = {}
+        n = len(self.b)
+        while self.i < n and self.b[self.i] != terminator:
+            if self.b[self.i] != _MSDP_VAR:
+                self.i += 1            # resync on stray bytes
+                continue
+            self.i += 1
+            name = self.read_scalar()
+            if self.i < n and self.b[self.i] == _MSDP_VAL:
+                self.i += 1
+                obj[name] = self.parse_value()
+            else:
+                obj[name] = ""          # VAR with no VAL — preserve the name
+        if terminator is not None and self.i < n:
+            self.i += 1                 # consume the CLOSE byte
+        return obj
+
+    def parse_value(self):
+        if self.i >= len(self.b):
+            return ""
+        c = self.b[self.i]
+        if c == _MSDP_TABLE_OPEN:
+            self.i += 1
+            if self.depth >= _MSDP_MAX_DEPTH:
+                self.overflowed = True
+                return {}
+            self.depth += 1
+            try:
+                return self.parse_pairs(_MSDP_TABLE_CLOSE)
+            finally:
+                self.depth -= 1
+        if c == _MSDP_ARRAY_OPEN:
+            self.i += 1
+            if self.depth >= _MSDP_MAX_DEPTH:
+                self.overflowed = True
+                return []
+            self.depth += 1
+            try:
+                return self.parse_array()
+            finally:
+                self.depth -= 1
+        return self.read_scalar()
+
+    def parse_array(self):
+        arr = []
+        n = len(self.b)
+        while self.i < n and self.b[self.i] != _MSDP_ARRAY_CLOSE:
+            if self.b[self.i] != _MSDP_VAL:
+                self.i += 1
+                continue
+            self.i += 1
+            arr.append(self.parse_value())
+        if self.i < n:
+            self.i += 1                 # consume ARRAY_CLOSE
+        return arr
+
+    def read_scalar(self):
+        start = self.i
+        n = len(self.b)
+        while self.i < n and self.b[self.i] > _MSDP_ARRAY_CLOSE:
+            self.i += 1
+        return bytes(self.b[start:self.i]).decode("utf-8", "replace")
+
+
+def parse_msdp(payload):
+    """Decode an MSDP subneg ``payload`` (starting with option byte 69) into its
+    top-level ``{name: value}`` map (scalars/tables/arrays). Returns ``None`` when not
+    MSDP, oversized, or nested past the depth cap."""
+    if not payload or payload[0] != MSDP:
+        return None
+    body = payload[1:]
+    if len(body) > _MAX_SUBNEG_BODY:
+        return None
+    parser = _MsdpParser(body)
+    result = parser.parse_pairs(None)
+    if parser.overflowed:
+        return None
+    return result
+
+
+def msdp_to_structured_events(variables):
+    """Map a parsed MSDP variable map onto StructuredEvent wire dicts (mirrors
+    MSDP.swift): vitals are aggregated into one ``vitals`` event, ``ROOM`` becomes a
+    ``room`` event, everything else is preserved verbatim as ``raw``. Deterministic
+    order: vitals, then room, then unknowns sorted by name."""
+    vitals_bag = {}
+    room_event = None
+    raw_events = []
+    for name in sorted(variables.keys()):
+        value = variables[name]
+        upper = name.upper()
+        if upper == "ROOM" and isinstance(value, dict):
+            room_event = _room_event(value)
+        elif upper in _MSDP_VITALS:
+            vitals_bag[name] = value
+        else:
+            raw_events.append(_raw_event(name, value))
+    events = []
+    if vitals_bag:
+        events.append(_msdp_vitals_event(vitals_bag))
+    if room_event is not None:
+        events.append(room_event)
+    events.extend(raw_events)
+    return events
+
+
+def _msdp_vitals_event(variables):
+    """Aggregate MSDP vitals variables into one ``vitals`` event. MSDP scalars are
+    strings, so numeric fields are coerced (matching GMCP); CHARACTER_NAME -> name,
+    LEVEL -> level; non-numeric vitals stay as verbatim string fields."""
+    name = None
+    level = None
+    gauges = {}
+    fields = {}
+    for key, value in variables.items():
+        upper = key.upper()
+        if upper == "CHARACTER_NAME":
+            name = _msdp_scalar_string(value)
+            continue
+        if upper == "LEVEL":
+            num = _coerce_number(value)
+            if num is not None:
+                level = int(num)
+                continue
+        num = _coerce_number(value)
+        if num is not None:
+            gauges[key] = num
+        else:
+            fields[key] = _msdp_scalar_string(value)
+    payload = {"gauges": gauges, "fields": fields}
+    if name is not None:
+        payload["name"] = name
+    if level is not None:
+        payload["level"] = level
+    return {"type": "vitals", "data": payload}
+
+
+def _msdp_scalar_string(value):
+    """An MSDP value as a plain string (values are strings on the wire; a container
+    falls back to compact JSON so nothing is silently lost)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return "{}".format(value)
+    if value is None:
+        return ""
+    return json.dumps(value, separators=(",", ":"))
 
 
 # --- typed mappings ---------------------------------------------------------

@@ -35,6 +35,8 @@ TTYPE = 24
 EOR = 25          # END-OF-RECORD *option* (not the 239 marker byte)
 NAWS = 31
 CHARSET = 42
+MSDP = 69         # MUD Server Data Protocol (out-of-band structured data).
+MSSP = 70         # MUD Server Status Protocol (server metadata).
 GMCP = 201        # Generic MUD Communication Protocol (out-of-band JSON).
 
 # GMCP handshake: who we are, and the package families the relay parses+forwards.
@@ -77,8 +79,10 @@ class Negotiator:
                  term_types=None, charset="UTF-8", cols=80, rows=24):
         self.local_ok = set(local_options if local_options is not None
                             else (BINARY, TTYPE, NAWS))
+        # Accept MSSP/MSDP too (#146): replying DO lets the server stream its status
+        # metadata / structured data, which structured.py forwards to relay clients.
         self.remote_ok = set(remote_options if remote_options is not None
-                             else (BINARY, EOR, CHARSET, GMCP))
+                             else (BINARY, EOR, CHARSET, MSDP, MSSP, GMCP))
         self.term_types = list(term_types) if term_types else default_term_types()
         self.charset = charset
         self.set_window_size(cols, rows)

@@ -3,7 +3,7 @@ import unittest
 
 from glyph_relay.negotiator import (
     Negotiator, IAC, WILL, WONT, DO, DONT, SB, SE,
-    BINARY, SGA, TTYPE, EOR, NAWS, CHARSET, GMCP,
+    BINARY, SGA, TTYPE, EOR, NAWS, CHARSET, GMCP, MSSP, MSDP,
     TTYPE_IS, TTYPE_SEND, CHARSET_REQUEST, CHARSET_ACCEPTED, CHARSET_REJECTED,
 )
 
@@ -34,6 +34,18 @@ class NegotiationTest(unittest.TestCase):
         r = self.n.receive_negotiation(WILL, CHARSET)
         self.assertEqual(r, bytes([IAC, DO, CHARSET]))
         self.assertTrue(self.n.remote_enabled(CHARSET))
+
+    def test_will_mssp_is_accepted_with_do(self):
+        # #146: accepting MSSP lets the server stream its status metadata, which the
+        # relay forwards as a serverStatus structured event.
+        r = self.n.receive_negotiation(WILL, MSSP)
+        self.assertEqual(r, bytes([IAC, DO, MSSP]))
+        self.assertTrue(self.n.remote_enabled(MSSP))
+
+    def test_will_msdp_is_accepted_with_do(self):
+        r = self.n.receive_negotiation(WILL, MSDP)
+        self.assertEqual(r, bytes([IAC, DO, MSDP]))
+        self.assertTrue(self.n.remote_enabled(MSDP))
 
     def test_binary_is_accepted_both_directions(self):
         self.assertEqual(self.n.receive_negotiation(DO, BINARY), bytes([IAC, WILL, BINARY]))
