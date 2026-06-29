@@ -27,7 +27,8 @@ class UserSession:
     def __init__(self, host, port, email, password, character, *,
                  use_tls=True, ca_file=None, ca_data=None, backlog=500,
                  term_width=120, term_height=40, reconnect=True,
-                 connect_host=None, history=None, tenant_id=None, session_key=None):
+                 connect_host=None, history=None, tenant_id=None, session_key=None,
+                 push_notifier=None):
         self.host = host
         self.port = port
         self.email = email
@@ -47,7 +48,8 @@ class UserSession:
         self.tenant_id = tenant_id
         self.session_key = session_key
         self.created_at = None        # wall-clock epoch, set by the manager at mint
-        self.hub = Hub(backlog, sink=history, tenant_id=tenant_id, session_key=session_key)
+        self.hub = Hub(backlog, sink=history, tenant_id=tenant_id, session_key=session_key,
+                       notifier=push_notifier)
         self._steps = default_login_steps(email, password, character)
         self._secrets = {s.value for s in self._steps if s.secret and s.value}
         self._login = LoginFlow(self._steps)
@@ -177,7 +179,7 @@ class SessionHandle:
 class SessionManager:
     def __init__(self, *, host, port, use_tls=True, ca_file=None, max_user_sessions=20,
                  idle_ttl=None, enroll_registry=None, max_sessions_per_tenant=None,
-                 history=None):
+                 history=None, push_notifier=None):
         self.host = host
         self.port = port
         self.use_tls = use_tls
@@ -192,6 +194,9 @@ class SessionManager:
         self.enroll_registry = enroll_registry
         # Durable per-tenant history sink (§3). None = RAM-only Hubs (self-host).
         self.history = history
+        # Push-trigger notifier (§4.2.1), threaded into each session's Hub. None =
+        # feature off (self-host / hosted-without-push), unchanged.
+        self.push_notifier = push_notifier
         self._bootstrap_token = None
         self._handles = {}            # token -> SessionHandle
         self._sessions = {}           # token -> UserSession (user sessions only)
@@ -339,7 +344,8 @@ class SessionManager:
                            password=password, character=character,
                            use_tls=use_tls, ca_file=self.ca_file, ca_data=ca_data,
                            connect_host=connect_host, history=self.history,
-                           tenant_id=tenant_id, session_key=token)
+                           tenant_id=tenant_id, session_key=token,
+                           push_notifier=self.push_notifier)
         sess.created_at = now if now is not None else time.time()
         await sess.start()
         self._sessions[token] = sess

@@ -56,12 +56,23 @@ def build_relay(mode, env):
         if env.get("RELAY_TARGET_PORTS"):       # "lo-hi"
             lo, _, hi = env["RELAY_TARGET_PORTS"].partition("-")
             target_ports = (int(lo), int(hi))
+        # Push-trigger notifier (§4.2.1): only when BOTH the endpoint and the shared
+        # secret are set. RELAY_NOTIFY_URL is a fixed operator value (never tenant-
+        # influenced); RELAY_NOTIFY_SECRET is env-only (never a CLI flag). Unset ⇒
+        # None ⇒ the relay never POSTs (hosted-without-push unchanged).
+        push_notifier = None
+        if env.get("RELAY_NOTIFY_URL") and env.get("RELAY_NOTIFY_SECRET"):
+            from .push import PushNotifier
+            push_notifier = PushNotifier(
+                env["RELAY_NOTIFY_URL"], env["RELAY_NOTIFY_SECRET"],
+                rate=_int(env, "RELAY_NOTIFY_RATE", 120),
+                window=float(env.get("RELAY_NOTIFY_WINDOW", "60")))
         manager = SessionManager(
             host=env.get("MUD_HOST", "-"), port=_int(env, "MUD_PORT", 0),
             use_tls=_flag(env, "MUD_TLS", True),
             max_user_sessions=_int(env, "MAX_SESSIONS", 200),
             max_sessions_per_tenant=_int(env, "MAX_PER_TENANT", 5),
-            idle_ttl=idle_ttl, history=history)
+            idle_ttl=idle_ttl, history=history, push_notifier=push_notifier)
         return Relay(
             manager=manager, host=relay_host, port=relay_port,
             authenticator=BrokerTokenAuth(keys, denylist),

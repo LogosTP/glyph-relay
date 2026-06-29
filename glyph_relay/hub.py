@@ -18,7 +18,7 @@ class Hub:
     """Bounded ring buffer of (id, kind, data) events with live fan-out."""
 
     def __init__(self, capacity=500, queue_maxsize=2000,
-                 sink=None, tenant_id=None, session_key=None):
+                 sink=None, tenant_id=None, session_key=None, notifier=None):
         self.capacity = capacity
         # Per-subscriber live queue bound. A stalled client (blocked on drain)
         # stops consuming; without a bound its queue would grow without limit and
@@ -32,6 +32,11 @@ class Hub:
         self.sink = sink
         self.tenant_id = tenant_id
         self.session_key = session_key
+        # Optional push-trigger notifier (hosted mode, §4.2.1). When set, publish()
+        # hands each freshly-assigned persisted event to it for coarse classify +
+        # per-(tenant,session) rate-limit + fire-and-forget notify POST. Self-host /
+        # hosted-without-push leaves notifier=None -> byte-for-byte unchanged.
+        self.notifier = notifier
         # §3.1 event-id continuity: seed from MAX(persisted)+1 so ids don't rewind or
         # collide across a relay restart that re-opens the same durable session.
         self._next_id = 1
@@ -60,6 +65,15 @@ class Hub:
                 except asyncio.QueueEmpty:
                     pass
             q.put_nowait(event)
+        # §4.2.1 push trigger: after live fan-out, hand the freshly-assigned event to
+        # the notifier (coarse classify + rate-limit + fire-and-forget POST). Only
+        # persisted events — device-ingest backfill (persist=False) never push-notifies.
+        # A notifier bug must NEVER break event delivery, so isolate it.
+        if self.notifier is not None and persist:
+            try:
+                self.notifier(self.tenant_id, self.session_key, event[0], kind, data)
+            except Exception:
+                pass
         return event[0]
 
     def durable_backlog(self, since_id=None):
