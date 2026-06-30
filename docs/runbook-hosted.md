@@ -137,6 +137,31 @@ it like `SHARED_HMAC_KEY`: rotate both sides together.
 7. Verify the notify hop end-to-end (a test `tell` ⇒ device push) with a real device
    token in `glyph-hosted`'s registry.
 
+### Go-live verification (#279)
+
+The co-located `glyph-hosted` ships a read-only readiness probe
+(`glyph-hosted/ops/readiness_probe.py`) that covers BOTH services from one place. Run it on
+this host after deploy — its loopback tier confirms the relay→hosted notify wiring without any
+secret:
+
+```sh
+# Relay reachable + healthy:
+curl -fsS https://relay.<domain>/health                      # -> {"ok": true}
+ss -ltnp 'sport = :8765'                                      # bound 127.0.0.1 only
+
+# Notify-secret byte-match WITHOUT knowing the secret (run on this host): a WRONG secret must
+# reach the auth gate (401), not the feature-off path (503). 503 ⇒ RELAY_NOTIFY_SECRET unset on
+# one side; a silent mismatch otherwise means no push + no relay-side log.
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8080/v1/push/notify \
+  -H 'X-Relay-Notify: deliberately-wrong' -d '{}'            # -> 401 (wired) / 503 (unset)
+
+python3 /opt/glyph-hosted/ops/readiness_probe.py --loopback http://127.0.0.1:8080
+```
+
+The relay is **Apple-environment agnostic** — it forwards a coarse category + snippet and never
+sees StoreKit/APNs. The Sandbox → Production cutover and rollback are a `glyph-hosted` concern
+(`APP_STORE_ENV`); see `glyph-hosted/docs/runbook-deploy.md` §11. No relay restart is involved.
+
 ### Blocking infra (filed, not performed here)
 
 The host provisioning, encrypted-volume mount, tunnel DNS, and APNs portal steps are
