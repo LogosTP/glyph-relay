@@ -21,13 +21,31 @@ from .structured import structured_events
 from .login import LoginFlow, default_login_steps, HEALTHY_SESSION_SECONDS
 
 
+def _scrub_structured(secrets, obj):
+    """Recursively mask every secret in a structured-event payload before it is
+    published. A MUD can echo a just-typed password back inside an out-of-band GMCP
+    package (e.g. a commChannel ``text``); without this the raw secret would reach the
+    push payload AND durable history, defeating the §3 'publish is always fed
+    post-_scrub text' invariant for the ``structured`` kind. ``scrub_secrets`` is a
+    no-op when nothing matches, so normal structured/vitals/room/comm data is
+    byte-for-byte unchanged."""
+    if isinstance(obj, str):
+        return scrub_secrets(secrets, obj)
+    if isinstance(obj, dict):
+        return {k: _scrub_structured(secrets, v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_structured(secrets, v) for v in obj]
+    return obj
+
+
 class UserSession:
     """One product user's RAM-only MUD session, driven solely by the relay."""
 
     def __init__(self, host, port, email, password, character, *,
                  use_tls=True, ca_file=None, ca_data=None, backlog=500,
                  term_width=120, term_height=40, reconnect=True,
-                 connect_host=None, history=None, tenant_id=None, session_key=None):
+                 connect_host=None, history=None, tenant_id=None, session_key=None,
+                 push_notifier=None):
         self.host = host
         self.port = port
         self.email = email
@@ -47,7 +65,8 @@ class UserSession:
         self.tenant_id = tenant_id
         self.session_key = session_key
         self.created_at = None        # wall-clock epoch, set by the manager at mint
-        self.hub = Hub(backlog, sink=history, tenant_id=tenant_id, session_key=session_key)
+        self.hub = Hub(backlog, sink=history, tenant_id=tenant_id, session_key=session_key,
+                       notifier=push_notifier)
         self._steps = default_login_steps(email, password, character)
         self._secrets = {s.value for s in self._steps if s.secret and s.value}
         self._login = LoginFlow(self._steps)
@@ -149,8 +168,10 @@ class UserSession:
             if text or prompt:
                 self.hub.publish("output", {"text": scrubbed, "prompt": prompt})
             # Forward out-of-band GMCP packages as shared structured events (#59).
+            # Scrub here too: a MUD can echo a secret inside a GMCP payload, and publish
+            # must be fed post-_scrub text for EVERY kind (output/echo/structured).
             for structured in structured_events(events):
-                self.hub.publish("structured", structured)
+                self.hub.publish("structured", _scrub_structured(self._secrets, structured))
 
     async def _writer(self, conn):
         while True:
@@ -177,7 +198,7 @@ class SessionHandle:
 class SessionManager:
     def __init__(self, *, host, port, use_tls=True, ca_file=None, max_user_sessions=20,
                  idle_ttl=None, enroll_registry=None, max_sessions_per_tenant=None,
-                 history=None):
+                 history=None, push_notifier=None):
         self.host = host
         self.port = port
         self.use_tls = use_tls
@@ -192,6 +213,9 @@ class SessionManager:
         self.enroll_registry = enroll_registry
         # Durable per-tenant history sink (§3). None = RAM-only Hubs (self-host).
         self.history = history
+        # Push-trigger notifier (§4.2.1), threaded into each session's Hub. None =
+        # feature off (self-host / hosted-without-push), unchanged.
+        self.push_notifier = push_notifier
         self._bootstrap_token = None
         self._handles = {}            # token -> SessionHandle
         self._sessions = {}           # token -> UserSession (user sessions only)
@@ -339,7 +363,8 @@ class SessionManager:
                            password=password, character=character,
                            use_tls=use_tls, ca_file=self.ca_file, ca_data=ca_data,
                            connect_host=connect_host, history=self.history,
-                           tenant_id=tenant_id, session_key=token)
+                           tenant_id=tenant_id, session_key=token,
+                           push_notifier=self.push_notifier)
         sess.created_at = now if now is not None else time.time()
         await sess.start()
         self._sessions[token] = sess
@@ -369,6 +394,11 @@ class SessionManager:
         sess = self._sessions.pop(token, None)
         if sess is not None:
             await sess.close()
+        # Reclaim this session's push rate-limiter so PushNotifier._limiters can't grow
+        # for the daemon's lifetime. ``token`` is the session_key. Guard for a plain
+        # callable notifier (no ``forget``) so self-host / test doubles still work.
+        if self.push_notifier is not None and hasattr(self.push_notifier, "forget"):
+            self.push_notifier.forget(getattr(sess, "tenant_id", None), token)
         return True
 
     async def close_all(self):

@@ -62,3 +62,89 @@ encrypted volume (FileVault / LUKS / cloud volume encryption). See
 closes idle sessions (loop clock) and, in self-host #140 deployments, sessions whose
 enrollment was revoked/expired (wall clock). In hosted mode, revocation is immediate
 at the gate (denylist) plus `POST /admin/revoke` reaps live sessions on demand.
+
+## Push-trigger pipeline
+
+The relay turns live MUD events into APNs pushes **without** holding any push tokens,
+consent state, or per-user keywords — those stay in the private `glyph-hosted` store.
+The relay does only a coarse, synchronous classification (`glyph_relay/push.py`,
+spec §4.2.1) and a best-effort server-to-server notify POST to the co-located hosted
+sender. Constructed only when **both** `RELAY_NOTIFY_URL` and `RELAY_NOTIFY_SECRET`
+are set; unset ⇒ no notifier ⇒ hosted-without-push is byte-for-byte unchanged.
+
+**The hop.** On each persisted `Hub.publish`, `PushNotifier` classifies the event
+into a coarse `category` (`disconnect` / `tell` / `channel` / `highlight`) with a
+bounded ≤256-char snippet, applies a per-(tenant, session) sliding-window cap
+(`RELAY_NOTIFY_RATE`/`RELAY_NOTIFY_WINDOW`, default 120/60s), and fire-and-forgets a
+plain HTTP/1.1 POST to `RELAY_NOTIFY_URL`. The POST carries
+`Content-Type: application/json` and `X-Relay-Notify: <RELAY_NOTIFY_SECRET>`; the
+hosted sender holds the token registry + consent + keyword match and performs the
+actual APNs send. The POST **never raises** and **never logs** the secret or the
+event text — a dead/refusing hosted sender must not break relay event delivery.
+
+```
+   MUD ──tn/tls──▶ glyph-relay ──SSE/POST──▶ phone client
+                       │
+                       │ classify + rate-limit (loopback only)
+                       ▼
+   127.0.0.1:8080  glyph-hosted  POST /v1/push/notify  (X-Relay-Notify: <secret>)
+                       │ consent + keyword + token registry
+                       ▼
+                     APNs ──▶ device
+```
+
+**Config.** Point `RELAY_NOTIFY_URL` at the co-located hosted sender on loopback:
+
+```
+RELAY_NOTIFY_URL=http://127.0.0.1:8080/v1/push/notify
+RELAY_NOTIFY_SECRET=<env-only; MUST byte-match glyph-hosted's notify secret>
+```
+
+`RELAY_NOTIFY_SECRET` is a **secret, env-only** value (never a CLI flag). It must
+byte-match the value `glyph-hosted` checks on `POST /v1/push/notify`; a mismatch
+makes every notify a silent 401 (the relay swallows it — no push, no error). Treat
+it like `SHARED_HMAC_KEY`: rotate both sides together.
+
+### Loopback / firewall posture
+
+- **Notify hop stays on loopback.** `glyph-relay` and `glyph-hosted` are co-located;
+  the notify POST goes 127.0.0.1 → 127.0.0.1 and must **never** leave the host. Do
+  not route `RELAY_NOTIFY_URL` through the tunnel or a public address — the shared
+  notify secret is the only auth on that endpoint.
+- **`/admin/*` stays on loopback** (see "Ingress + admin firewalling" above): the
+  cloudflared template (`ops/cloudflared-relay.yml`) returns 404 for `/admin/*` on
+  the public hostname; the backend reaches admin + notify over the private path.
+- **`glyph-hosted` binds loopback too.** Its `POST /v1/push/notify` (8080) accepts
+  only the relay's loopback connection with a valid `X-Relay-Notify`; it is never
+  fronted by the tunnel. Outbound APNs (443) is the only public egress it needs.
+- The relay's own bind is `127.0.0.1:8765` (`ops/glyph-relay.service`); confirm with
+  `ss -ltnp 'sport = :8765'` that it is not on a routable interface.
+
+### Deploy checklist
+
+1. Install `glyph-relay` to `/opt/glyph-relay`; install
+   `ops/glyph-relay.service` → `/etc/systemd/system/`.
+2. Write `/etc/glyph-relay/relay.env` from `.env.example` (root-owned, `chmod 0600`):
+   set `RELAY_MODE=hosted`, `SHARED_HMAC_KID/KEY`, `RELAY_ADMIN_SECRET`,
+   `HISTORY_DB=/var/lib/glyph-relay/history.db`, the target allowlist, and the
+   `RELAY_NOTIFY_URL`/`RELAY_NOTIFY_SECRET` pair.
+3. Put `HISTORY_DB` on an encrypted volume (`docs/privacy-hosted.md`).
+4. Deploy `glyph-hosted` co-located, bound loopback `127.0.0.1:8080`, with the SAME
+   `RELAY_NOTIFY_SECRET` and its APNs `.p8` (env/secret-store only, never committed).
+5. Install `ops/cloudflared-relay.yml` → `/etc/cloudflared/config.yml`; fill tunnel
+   UUID + credentials + `relay.<domain>`; verify `/admin/*` returns 404 publicly.
+6. `systemctl enable --now glyph-relay`; check `GET https://relay.<domain>/health`.
+7. Verify the notify hop end-to-end (a test `tell` ⇒ device push) with a real device
+   token in `glyph-hosted`'s registry.
+
+### Blocking infra (filed, not performed here)
+
+The host provisioning, encrypted-volume mount, tunnel DNS, and APNs portal steps are
+tracked as homelab infra issues — referenced, not executed, by this repo:
+
+- **homelab#274** — provision the relay host + encrypted `HISTORY_DB` volume + the
+  `glyph-relay` systemd unit and `/etc/glyph-relay/relay.env`.
+- **homelab#275** — cloudflared tunnel + `relay.<domain>` DNS; assert `/admin/*` and
+  the notify hop are loopback-only (not publicly routable).
+- **homelab#276** — Apple Developer portal: APNs `.p8` auth key + bundle/key ids for
+  `glyph-hosted`; deliver to the secret store (never the repo).

@@ -3,8 +3,9 @@
 
 Config is read from the environment (see ``config.build_relay``); a few common knobs
 are also exposed as CLI flags that override the environment. Secrets
-(``GLYPH_ENROLL_SECRET``, ``SHARED_HMAC_KEY``, ``RELAY_ADMIN_SECRET``) are ENV-ONLY —
-never CLI flags — so they don't land in a process listing.
+(``GLYPH_ENROLL_SECRET``, ``SHARED_HMAC_KEY``, ``RELAY_ADMIN_SECRET``,
+``RELAY_NOTIFY_SECRET``) are ENV-ONLY — never CLI flags — so they don't land in a
+process listing.
 
     python3 -m glyph_relay --mud-host mud.example.com --mud-port 4000
     python3 -m glyph_relay --mode hosted --relay-target-allowlist servers.txt
@@ -31,6 +32,9 @@ def _env_from_args(argv=None):
     parser.add_argument("--relay-enroll-db", help="per-user enrollment registry path (#140)")
     parser.add_argument("--relay-target-allowlist",
                         help="host[:port]-per-line target allowlist (hosted SSRF policy)")
+    parser.add_argument("--relay-notify-url",
+                        help="hosted push-notify endpoint (RELAY_NOTIFY_URL; hosted "
+                             "mode only; RELAY_NOTIFY_SECRET is env-only)")
     parser.add_argument("--reaper-interval", type=float, default=60.0,
                         help="idle/revocation reaper period in seconds")
     args = parser.parse_args(argv)
@@ -40,6 +44,7 @@ def _env_from_args(argv=None):
         "host": "RELAY_HOST", "port": "RELAY_PORT", "mud_host": "MUD_HOST",
         "mud_port": "MUD_PORT", "relay_enroll_db": "RELAY_ENROLL_DB",
         "relay_target_allowlist": "RELAY_TARGET_ALLOWLIST",
+        "relay_notify_url": "RELAY_NOTIFY_URL",
     }
     for attr, key in mapping.items():
         val = getattr(args, attr)

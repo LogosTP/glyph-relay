@@ -32,7 +32,7 @@ def _token(tid, exp=9999999999):
 class _FakeUserSession:
     def __init__(self, *, host, port, email, password, character, use_tls,
                  ca_file=None, ca_data=None, connect_host=None, history=None,
-                 tenant_id=None, session_key=None):
+                 tenant_id=None, session_key=None, push_notifier=None):
         self.host = host
         self.port = port
         self.email = email

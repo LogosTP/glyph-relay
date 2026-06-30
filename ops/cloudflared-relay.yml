@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Elastic-2.0
+#
+# cloudflared tunnel ingress TEMPLATE for glyph-relay. Copy to
+# /etc/cloudflared/config.yml on the relay host, fill in the tunnel UUID +
+# credentials path + your hostname, then `cloudflared tunnel run`.
+#
+# The tunnel is the ONLY public reach for the loopback-bound relay
+# (127.0.0.1:8765). It terminates TLS at Cloudflare's edge and forwards plaintext
+# HTTP over the private path to the relay.
+
+tunnel: REPLACE-WITH-TUNNEL-UUID
+credentials-file: /etc/cloudflared/REPLACE-WITH-TUNNEL-UUID.json
+
+ingress:
+  # --- /admin/* is loopback-only (spec §6) -----------------------------------
+  # The admin routes (POST /admin/revoke|purge) must NEVER be reachable over the
+  # public hostname. This rule returns 404 for any /admin path and is ordered
+  # BEFORE the relay rule below, so admin traffic cannot traverse the tunnel.
+  # The backend (glyph-hosted) calls /admin/* directly on 127.0.0.1:8765, never
+  # through Cloudflare. The relay's own X-Relay-Admin gate is a backstop, not the
+  # primary control — the network path is.
+  - hostname: relay.example.com
+    path: ^/admin(/.*)?$
+    service: http_status:404
+
+  # --- Public relay surface --------------------------------------------------
+  # Everything else on the relay hostname forwards to the loopback relay:
+  # /health, /session, /sessions, /events (SSE), /command, /ingest, /logout.
+  - hostname: relay.example.com
+    service: http://127.0.0.1:8765
+
+  # Catch-all: reject any other hostname.
+  - service: http_status:404

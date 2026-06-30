@@ -3,10 +3,11 @@
 which only ever sees post-_scrub payloads, so a raw MUD password is NEVER persisted.
 Driven end-to-end against the stub MUD (the strongest possible guard)."""
 import asyncio
+import json
 import unittest
 
 from glyph_relay.history import HistoryStore
-from glyph_relay.sessions import SessionManager
+from glyph_relay.sessions import SessionManager, UserSession
 from stub.stub_server import Room, handle
 
 
@@ -50,6 +51,43 @@ class ScrubInvariantTest(unittest.IsolatedAsyncioTestCase):
             history.close()
             server.close()
             await server.wait_closed()
+
+
+class _OneShotConn:
+    """A Connection double that hands ``_reader`` exactly one ``(text, events)``
+    frame and then stops, so the scrub path can be driven without a live socket."""
+
+    def __init__(self, frame):
+        self._frame = frame
+
+    async def receive(self):
+        yield self._frame
+
+    async def close(self):
+        pass
+
+
+class StructuredScrubInvariantTest(unittest.IsolatedAsyncioTestCase):
+    async def test_structured_event_text_masked_before_publish(self):
+        # A MUD can echo a just-typed password back inside an out-of-band GMCP package
+        # (here a Comm.Channel ``text``). The relay must scrub the structured payload
+        # BEFORE publish so the raw secret never reaches the Hub fan-out, the push
+        # notifier, or the durable sink — the §3 invariant must hold for ALL kinds.
+        secret = "throwaway-pw-structured-7461"
+        sess = UserSession("h", 23, "a@x.com", secret, "Alice", use_tls=False)
+        self.assertIn(secret, sess._secrets)   # password is a configured secret
+        # GMCP (option byte 201) Comm.Channel frame carrying the secret in its text.
+        body = json.dumps({"channel": "tells",
+                           "text": "psst the password is {0}".format(secret)})
+        payload = bytes([201]) + ("Comm.Channel " + body).encode("utf-8")
+        conn = _OneShotConn(("", [("subneg", payload)]))
+        await sess._reader(conn)
+        structured = [data for _id, kind, data in sess.hub.backlog()
+                      if kind == "structured"]
+        self.assertEqual(len(structured), 1)
+        blob = json.dumps(structured[0])
+        self.assertNotIn(secret, blob)        # raw password absent from published event
+        self.assertIn("********", blob)       # masked instead
 
 
 if __name__ == "__main__":
